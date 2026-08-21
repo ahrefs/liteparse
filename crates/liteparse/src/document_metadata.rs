@@ -27,6 +27,8 @@ pub(crate) fn extract(input: &PdfInput, document: &Document<'_>) -> DocumentMeta
         PdfInput::Path(_) => DocumentMetadata::default(),
     };
 
+    metadata.subject = document.meta_text("Subject");
+    metadata.keywords = document.meta_text("Keywords");
     metadata.creation_date = document.meta_text("CreationDate");
     metadata.mod_date = document.meta_text("ModDate");
     metadata.file_version = document.file_version();
