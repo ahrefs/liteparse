@@ -525,46 +525,61 @@ fn rect_from_pdfium(rect: RectF) -> Rect {
     }
 }
 
-/// Assign hyperlink URIs to text items whose bbox center falls inside a link
+/// Assign hyperlink URIs to text items substantially covered by a link
 /// annotation's rectangle. Both the item bbox and the link rect are in
-/// viewport space. First matching link wins.
+/// viewport space. When rectangles overlap, the largest overlap wins.
 ///
 /// A link rect taller than `MULTILINE_DROP_FACTOR`× the height of the text it
 /// covers is a multi-line annotation given to us as a single *union* box (no
-/// per-line quad points). Its true anchor — which words on the intervening
-/// lines are actually linked — is unrecoverable, so we drop it rather than
-/// wrap a whole sentence in a misleading link. Well-formed multi-line links
-/// expose quad points and arrive here as one single-line rect per line.
+/// per-line quad points). Its true anchor is ambiguous, so retain only the top
+/// covered line. Well-formed multi-line links expose quad points and arrive
+/// here as one single-line rect per line.
 fn assign_links(items: &mut [TextItem], links: &[PdfLink]) {
     if links.is_empty() {
         return;
     }
     const MULTILINE_DROP_FACTOR: f32 = 1.8;
-    for link in links {
+    const MIN_VERTICAL_COVERAGE: f32 = 0.5;
+    /// Items whose top lies within this many median item heights of the
+    /// topmost covered item are taken to be on the same line.
+    const SAME_LINE_TOLERANCE: f32 = 0.5;
+    let mut best: Vec<Option<(usize, f32)>> = vec![None; items.len()];
+    for (link_index, link) in links.iter().enumerate() {
         let r = &link.rect;
-        let covered: Vec<usize> = items
+        let mut covered: Vec<(usize, f32)> = items
             .iter()
             .enumerate()
-            .filter(|(_, it)| {
-                let cx = it.x + it.width / 2.0;
-                let cy = it.y + it.height / 2.0;
-                cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom
+            .filter_map(|(i, it)| {
+                let horizontal_overlap = (it.x + it.width).min(r.right) - it.x.max(r.left);
+                let vertical_overlap = (it.y + it.height).min(r.bottom) - it.y.max(r.top);
+                let covers = horizontal_overlap > 0.0
+                    && it.height > 0.0
+                    && vertical_overlap >= MIN_VERTICAL_COVERAGE * it.height;
+                covers.then(|| (i, horizontal_overlap * vertical_overlap))
             })
-            .map(|(i, _)| i)
             .collect();
-        if covered.is_empty() {
-            continue;
-        }
-        let mut heights: Vec<f32> = covered.iter().map(|&i| items[i].height).collect();
+        let mut heights: Vec<f32> = covered.iter().map(|&(i, _)| items[i].height).collect();
         heights.sort_by(f32::total_cmp);
-        let median_h = heights[heights.len() / 2];
-        if median_h > 0.0 && (r.bottom - r.top) > MULTILINE_DROP_FACTOR * median_h {
-            continue;
+        if let Some(&median_h) = heights.get(heights.len() / 2)
+            && median_h > 0.0
+            && (r.bottom - r.top) > MULTILINE_DROP_FACTOR * median_h
+            && let Some(top) = covered
+                .iter()
+                .map(|&(i, _)| items[i].y)
+                .min_by(f32::total_cmp)
+        {
+            covered.retain(|&(i, _)| items[i].y <= top + median_h * SAME_LINE_TOLERANCE);
         }
-        for &i in &covered {
-            if items[i].link.is_none() {
-                items[i].link = Some(link.uri.clone());
+        for (item_index, overlap) in covered {
+            if best[item_index].is_none_or(|(_, previous)| overlap > previous) {
+                best[item_index] = Some((link_index, overlap));
             }
+        }
+    }
+
+    for (item, assignment) in items.iter_mut().zip(best) {
+        if let Some((link_index, _)) = assignment {
+            item.link = Some(links[link_index].uri.clone());
         }
     }
 }
