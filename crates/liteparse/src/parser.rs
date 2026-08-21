@@ -47,6 +47,10 @@ pub struct ParseResult {
     /// PDFium form type (0 none, 1 AcroForm, 2 XFA full, 3 XFA foreground),
     /// present only when form-field extraction is enabled.
     pub form_type: Option<i32>,
+    /// The document's `/Info` `Title` entry, when present.
+    pub title: Option<String>,
+    /// The document's `/Info` `Author` entry, when present.
+    pub author: Option<String>,
     /// The document's `/Info` `Creator` entry, when present.
     pub creator: Option<String>,
     /// The document's `/Info` `Producer` entry, when present.
@@ -587,6 +591,8 @@ impl LiteParse {
             image_error_count,
             complexity,
             form_type,
+            title,
+            author,
             creator,
             producer,
             doc_meta,
@@ -614,6 +620,8 @@ impl LiteParse {
                 .config
                 .extract_form_fields
                 .then(|| document.form_type());
+            let title = document.meta_text("Title");
+            let author = document.meta_text("Author");
             let creator = document.meta_text("Creator");
             let producer = document.meta_text("Producer");
             let doc_meta = want_doc_meta.then(|| {
@@ -764,6 +772,8 @@ impl LiteParse {
                 image_error_count,
                 complexity,
                 form_type,
+                title,
+                author,
                 creator,
                 producer,
                 doc_meta,
@@ -904,6 +914,8 @@ impl LiteParse {
             screenshots,
             image_error_count,
             form_type,
+            title,
+            author,
             creator,
             producer,
             doc_meta,
@@ -943,6 +955,8 @@ impl LiteParse {
             screenshots: Vec::new(),
             image_error_count: 0,
             form_type: None,
+            title: None,
+            author: None,
             creator: None,
             producer: None,
             doc_meta: None,
@@ -1059,6 +1073,8 @@ impl LiteParse {
             screenshots: Vec::new(),
             image_error_count: 0,
             form_type: None,
+            title: None,
+            author: None,
             creator: None,
             producer: None,
             doc_meta: None,

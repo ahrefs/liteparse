@@ -410,6 +410,8 @@ mod tests {
             screenshots: vec![],
             image_error_count: 2,
             form_type: None,
+            title: None,
+            author: None,
             creator: Some("LibreOffice".into()),
             producer: Some("LibreOffice 7.4".into()),
             doc_meta: Some(crate::types::DocumentMetadata::default()),
