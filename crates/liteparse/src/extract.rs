@@ -525,46 +525,71 @@ fn rect_from_pdfium(rect: RectF) -> Rect {
     }
 }
 
-/// Assign hyperlink URIs to text items whose bbox center falls inside a link
+/// Assign hyperlink URIs to text items substantially covered by a link
 /// annotation's rectangle. Both the item bbox and the link rect are in
-/// viewport space. First matching link wins.
+/// viewport space. When rectangles overlap, the largest overlap wins.
 ///
 /// A link rect taller than `MULTILINE_DROP_FACTOR`× the height of the text it
 /// covers is a multi-line annotation given to us as a single *union* box (no
-/// per-line quad points). Its true anchor — which words on the intervening
-/// lines are actually linked — is unrecoverable, so we drop it rather than
-/// wrap a whole sentence in a misleading link. Well-formed multi-line links
-/// expose quad points and arrive here as one single-line rect per line.
+/// per-line quad points). Its true anchor is ambiguous, so retain only the top
+/// covered line. Well-formed multi-line links expose quad points and arrive
+/// here as one single-line rect per line.
 fn assign_links(items: &mut [TextItem], links: &[PdfLink]) {
     if links.is_empty() {
         return;
     }
     const MULTILINE_DROP_FACTOR: f32 = 1.8;
+    const MIN_VERTICAL_COVERAGE: f32 = 0.5;
+    let mut candidates = Vec::with_capacity(links.len());
     for link in links {
         let r = &link.rect;
-        let covered: Vec<usize> = items
+        let mut covered: Vec<usize> = items
             .iter()
             .enumerate()
             .filter(|(_, it)| {
-                let cx = it.x + it.width / 2.0;
-                let cy = it.y + it.height / 2.0;
-                cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom
+                let horizontal_overlap = (it.x + it.width).min(r.right) - it.x.max(r.left);
+                let vertical_overlap = (it.y + it.height).min(r.bottom) - it.y.max(r.top);
+                horizontal_overlap > 0.0
+                    && it.height > 0.0
+                    && vertical_overlap >= MIN_VERTICAL_COVERAGE * it.height
             })
             .map(|(i, _)| i)
             .collect();
-        if covered.is_empty() {
-            continue;
-        }
-        let mut heights: Vec<f32> = covered.iter().map(|&i| items[i].height).collect();
-        heights.sort_by(f32::total_cmp);
-        let median_h = heights[heights.len() / 2];
-        if median_h > 0.0 && (r.bottom - r.top) > MULTILINE_DROP_FACTOR * median_h {
-            continue;
-        }
-        for &i in &covered {
-            if items[i].link.is_none() {
-                items[i].link = Some(link.uri.clone());
+        if !covered.is_empty() {
+            let mut heights: Vec<f32> = covered.iter().map(|&i| items[i].height).collect();
+            heights.sort_by(f32::total_cmp);
+            let median_h = heights[heights.len() / 2];
+            if median_h > 0.0 && (r.bottom - r.top) > MULTILINE_DROP_FACTOR * median_h {
+                let top = covered
+                    .iter()
+                    .map(|&i| items[i].y)
+                    .min_by(f32::total_cmp)
+                    .unwrap_or(r.top);
+                covered.retain(|&i| items[i].y <= top + median_h * MIN_VERTICAL_COVERAGE);
             }
+        }
+        candidates.push(covered);
+    }
+
+    let mut best = vec![None; items.len()];
+    for (link_index, covered) in candidates.iter().enumerate() {
+        let r = &links[link_index].rect;
+        for &item_index in covered {
+            let item = &items[item_index];
+            let horizontal_overlap = (item.x + item.width).min(r.right) - item.x.max(r.left);
+            let vertical_overlap = (item.y + item.height).min(r.bottom) - item.y.max(r.top);
+            let overlap = horizontal_overlap * vertical_overlap;
+            if best[item_index].is_none_or(|(_, previous)| overlap > previous) {
+                best[item_index] = Some((link_index, overlap));
+            }
+        }
+    }
+
+    for (item, assignment) in items.iter_mut().zip(best) {
+        if item.link.is_none()
+            && let Some((link_index, _)) = assignment
+        {
+            item.link = Some(links[link_index].uri.clone());
         }
     }
 }
