@@ -46,6 +46,16 @@ impl TesseractOcrEngine {
             .collect::<Vec<_>>()
             .join("+")
     }
+
+    fn language_for_script(script: &str) -> &'static str {
+        match script {
+            "Cyrillic" => "rus",
+            "Arabic" => "ara",
+            "Devanagari" => "hin",
+            "Han" | "HanS" | "HanT" | "Japanese" => "chi_sim+jpn",
+            _ => "eng",
+        }
+    }
 }
 
 impl OcrEngine for TesseractOcrEngine {
@@ -73,20 +83,27 @@ impl OcrEngine for TesseractOcrEngine {
         >,
     > {
         Box::pin(async move {
-            let language = Self::normalize_language(&options.language);
-
-            let api = TesseractAPI::new();
-
             // Determine tessdata path: explicit config > TESSDATA_PREFIX env > tesseract-rs default
             let tessdata_path = self
                 .tessdata_path
                 .clone()
                 .or_else(|| std::env::var("TESSDATA_PREFIX").ok());
-
             let resolved_path = tessdata_path.unwrap_or_else(default_tessdata_dir);
+            let language = if options.language == "auto" {
+                ensure_traineddata(Path::new(&resolved_path), "osd").await?;
+                let osd = TesseractAPI::new();
+                osd.init(&resolved_path, "osd")?;
+                set_image(&osd, image_data, width, height, options.dpi)?;
+                let (_, _, script, _) = osd.detect_os()?;
+                Self::language_for_script(&script).to_string()
+            } else {
+                Self::normalize_language(&options.language)
+            };
             for code in language.split('+') {
                 ensure_traineddata(Path::new(&resolved_path), code).await?;
             }
+
+            let api = TesseractAPI::new();
             api.init(&resolved_path, &language)?;
 
             // Match the tesseract CLI's default page segmentation mode (PSM_AUTO,
@@ -95,26 +112,7 @@ impl OcrEngine for TesseractOcrEngine {
             // uniform block of text and performs poorly on full-page layouts.
             api.set_page_seg_mode(TessPageSegMode::PSM_AUTO)?;
 
-            // Channels inferred from the buffer: 1 = grayscale, 3 = RGB.
-            let bytes_per_pixel = if width > 0 && height > 0 {
-                (image_data.len() / (width as usize * height as usize)).clamp(1, 4) as i32
-            } else {
-                3
-            };
-            let bytes_per_line = width as i32 * bytes_per_pixel;
-            api.set_image(
-                image_data,
-                width as i32,
-                height as i32,
-                bytes_per_pixel,
-                bytes_per_line,
-            )?;
-
-            // Tesseract can't infer DPI from a raw RGB buffer (there's no image
-            // header), so it falls back to a guess and warns. Tell it the actual
-            // render resolution so its internal point-size/threshold heuristics are
-            // correct. Must come after set_image, which resets the resolution.
-            api.set_source_resolution(options.dpi.round() as i32)?;
+            set_image(&api, image_data, width, height, options.dpi)?;
 
             api.recognize()?;
 
@@ -148,6 +146,29 @@ impl OcrEngine for TesseractOcrEngine {
             Ok(results)
         })
     }
+}
+
+fn set_image(
+    api: &TesseractAPI,
+    image_data: &[u8],
+    width: u32,
+    height: u32,
+    dpi: f32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes_per_pixel = if width > 0 && height > 0 {
+        (image_data.len() / (width as usize * height as usize)).clamp(1, 4) as i32
+    } else {
+        3
+    };
+    api.set_image(
+        image_data,
+        width as i32,
+        height as i32,
+        bytes_per_pixel,
+        width as i32 * bytes_per_pixel,
+    )?;
+    api.set_source_resolution(dpi.round().max(70.0) as i32)?;
+    Ok(())
 }
 
 /// Default tessdata directory. Matches the locations used by tesseract-rs's

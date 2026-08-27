@@ -43,34 +43,51 @@ pub(crate) fn extract(input: &PdfInput, document: &Document<'_>) -> DocumentMeta
     metadata.signature_byte_range_reaches_eof = signatures.byte_range_reaches_eof;
 
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some((xmp, truncated)) = catalog_xmp(input, metadata.raw_file_size) {
-        metadata.xmp = Some(xmp);
-        metadata.xmp_truncated = Some(truncated);
+    if metadata
+        .raw_file_size
+        .is_some_and(|size| size <= XMP_CATALOG_MAX_FILE_BYTES)
+        && let Some((language, xmp)) = catalog_facts(input)
+    {
+        metadata.catalog_language = language;
+        if let Some((xmp, truncated)) = xmp {
+            metadata.xmp = Some(xmp);
+            metadata.xmp_truncated = Some(truncated);
+        }
     }
     metadata
 }
 
-/// Read the document catalog's `/Metadata` XMP stream — the only XMP that is
-/// certainly the document's own. `None` when the file is too large to parse
-/// cheaply, has no catalog metadata, or cannot be decoded (encrypted or
-/// damaged); the caller then reports no XMP.
 #[cfg(not(target_arch = "wasm32"))]
-fn catalog_xmp(input: &PdfInput, file_size: Option<u64>) -> Option<(String, bool)> {
-    if file_size? > XMP_CATALOG_MAX_FILE_BYTES {
-        return None;
-    }
+fn catalog_facts(input: &PdfInput) -> Option<(Option<String>, Option<(String, bool)>)> {
     let document = match input {
         PdfInput::Path(path) => lopdf::Document::load(path).ok()?,
         PdfInput::Bytes(bytes) => lopdf::Document::load_mem(bytes).ok()?,
     };
-    let object = document.catalog().ok()?.get(b"Metadata").ok()?;
-    let stream = document.dereference(object).ok()?.1.as_stream().ok()?;
-    let bytes = stream
-        .decompressed_content()
-        .unwrap_or_else(|_| stream.content.clone());
-    let truncated = bytes.len() > XMP_MAX_BYTES;
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(XMP_MAX_BYTES)]).into_owned();
-    (!text.trim().is_empty()).then_some((text, truncated))
+    let catalog = document.catalog().ok()?;
+    let language = catalog
+        .get(b"Lang")
+        .ok()
+        .and_then(|object| document.dereference(object).ok())
+        .and_then(|(_, object)| object.as_str().ok())
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+        .filter(|language| !language.is_empty());
+    let xmp = catalog
+        .get(b"Metadata")
+        .ok()
+        .and_then(|object| document.dereference(object).ok())
+        .and_then(|(_, object)| object.as_stream().ok())
+        .map(|stream| {
+            stream
+                .decompressed_content()
+                .unwrap_or_else(|_| stream.content.clone())
+        })
+        .and_then(|bytes| {
+            let truncated = bytes.len() > XMP_MAX_BYTES;
+            let text =
+                String::from_utf8_lossy(&bytes[..bytes.len().min(XMP_MAX_BYTES)]).into_owned();
+            (!text.trim().is_empty()).then_some((text, truncated))
+        });
+    Some((language, xmp))
 }
 
 fn extract_raw_facts<R: Read + Seek>(reader: &mut R) -> DocumentMetadata {

@@ -20,6 +20,9 @@ const UNCOVERED_VECTOR_AREA_THRESHOLD: f32 = 400.0;
 /// coverage; smaller objects (rule lines, bullets, icons) are ignored.
 const MIN_IMAGE_SIZE_PT: f32 = 25.0;
 
+const MAX_IMAGE_OCR_TEXT_LENGTH: usize = 200;
+const MIN_IMAGE_OCR_COVERAGE: f32 = 0.2;
+
 /// A single image at or above this fraction of the page is treated as a
 /// full-page background and ignored.
 const MAX_IMAGE_PAGE_COVERAGE: f32 = 0.9;
@@ -50,7 +53,8 @@ pub(crate) struct RenderedPage {
 
 /// Why a page was flagged as needing more than the cheap text-only path.
 /// Multiple reasons can apply to one page (e.g. a sparse page whose little
-/// text is also garbled). Empty exactly when `needs_ocr` is false.
+/// text is also garbled). `Garbled` is diagnostic and does not by itself
+/// require OCR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComplexityReason {
@@ -126,9 +130,7 @@ pub struct PageComplexityStats {
     pub uncovered_vector_area: Option<f32>,
     pub is_garbled: bool,
     pub page_area: f32,
-    /// Whether the page needs more than the cheap text-only path. Equivalent to
-    /// `!reasons.is_empty()`; kept as a flat bool for the common predicate case
-    /// and as the internal per-page OCR gate.
+    /// Whether the page needs more than the cheap text-only path.
     pub needs_ocr: bool,
     /// Every reason the page was flagged, in no particular priority order.
     pub reasons: Vec<ComplexityReason>,
@@ -201,10 +203,9 @@ pub(crate) fn calculate_page_complexity(
         0.0
     };
 
-    // Low spatial coverage only signals a scan/sparse page when there also
-    // isn't much native text. A text-dense page (e.g. a ruled table with
-    // wide intra-cell whitespace) is spatially sparse but needs no OCR.
-    let sparse_text = text_length < 2000 && text_coverage < 0.15;
+    let sparse_text = text_length < MAX_IMAGE_OCR_TEXT_LENGTH
+        && text_coverage < 0.15
+        && image_coverage >= MIN_IMAGE_OCR_COVERAGE;
     let is_garbled = page_is_garbled(page);
 
     let mut reasons = Vec::new();
@@ -227,13 +228,13 @@ pub(crate) fn calculate_page_complexity(
         // There is real text, but it's too thin to be the whole page.
         reasons.push(ComplexityReason::SparseText);
     }
-    if has_images {
+    if sparse_text {
         reasons.push(ComplexityReason::EmbeddedImages);
     }
+    let mut needs_ocr = !reasons.is_empty();
     if is_garbled {
         reasons.push(ComplexityReason::Garbled);
     }
-    let mut needs_ocr = !reasons.is_empty();
 
     // Text drawn as filled vector outlines lives outside the text layer
     // entirely: no text items, no image XObjects, so none of the cheap
@@ -241,7 +242,7 @@ pub(crate) fn calculate_page_complexity(
     // path area that native text doesn't account for. Checked last so this
     // relatively expensive page-object walk only runs when the cheap predicates
     // all pass; when they don't, the area is left unmeasured (`None`).
-    let uncovered_vector_area = if !needs_ocr {
+    let uncovered_vector_area = if !needs_ocr && text_length < MAX_IMAGE_OCR_TEXT_LENGTH {
         let path_bounds = page_obj.filled_path_bounds(3.0, 0.9);
         let uncovered = uncovered_path_area(&path_bounds, &page.text_items);
         if uncovered >= UNCOVERED_VECTOR_AREA_THRESHOLD {
@@ -697,7 +698,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     ocr_language: &str,
     num_workers: usize,
     ocr_failure_fatal: bool,
-) -> Result<(), LiteParseError> {
+) -> Result<usize, LiteParseError> {
     type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
 
     // Browser WASM uses the JavaScript event loop. It has no Tokio runtime or
@@ -972,7 +973,7 @@ pub(crate) async fn ocr_and_merge_rendered(
         );
     }
 
-    Ok(())
+    Ok(total_tasks - failed_tasks)
 }
 
 /// True when the page's native (already-extracted) text is sparse enough that

@@ -404,6 +404,7 @@ mod tests {
                 page_number: 3,
                 message: "page extraction failed".into(),
             }],
+            ocr_pages_processed: 0,
             text: String::new(),
             outline: vec![],
             images: vec![image],
