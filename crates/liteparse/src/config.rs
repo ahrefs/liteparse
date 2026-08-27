@@ -7,6 +7,9 @@ pub struct LiteParseConfig {
     pub ocr_language: String,
     /// Whether OCR is enabled. When true, runs on text-sparse pages and embedded images.
     pub ocr_enabled: bool,
+    /// Maximum number of pages on which OCR may run during one parse.
+    #[serde(default = "default_max_ocr_pages")]
+    pub max_ocr_pages: usize,
     /// HTTP OCR server URL (uses Tesseract if not provided)
     pub ocr_server_url: Option<String>,
     /// Extra HTTP headers sent with every request to `ocr_server_url`, as
@@ -228,6 +231,7 @@ impl Default for LiteParseConfig {
             // fast if no engine is reachable, so a real misconfiguration is
             // never silently swallowed.
             ocr_enabled: cfg!(feature = "tesseract"),
+            max_ocr_pages: usize::MAX,
             ocr_server_url: None,
             ocr_server_headers: Vec::new(),
             tessdata_path: None,
@@ -272,6 +276,10 @@ fn default_num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(1)
+}
+
+fn default_max_ocr_pages() -> usize {
+    usize::MAX
 }
 
 /// Upper bound on the number of pages a `--target-pages` argument may expand

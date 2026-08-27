@@ -28,6 +28,8 @@ pub struct ParseResult {
     /// Page-level PDFium extraction failures collected when
     /// `continue_on_page_error` is enabled.
     pub page_errors: Vec<PageError>,
+    /// Number of rendered pages whose OCR engine call completed successfully.
+    pub ocr_pages_processed: usize,
     /// Full document text, concatenated from all pages.
     pub text: String,
     /// Document outline (bookmarks) when present. Used by the markdown
@@ -786,8 +788,13 @@ impl LiteParse {
         let mut pages = pages;
         let t1 = web_time::Instant::now();
 
+        let mut ocr_pages_processed = 0;
         if let Some(engine) = ocr_engine {
-            let round_rasters = self.config.num_workers.max(1);
+            let round_rasters = self
+                .config
+                .num_workers
+                .max(1)
+                .min(self.config.max_ocr_pages.max(1));
             // Extraction may have flattened SOME pages' form widgets into
             // page content in its (now dropped) document instance; re-apply
             // per round on exactly those pages so the rasters match what
@@ -801,8 +808,9 @@ impl LiteParse {
                 };
             let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
             let mut round_start = 0usize;
-            while round_start < pages.len() {
-                let (rendered, next_start) = {
+            let mut ocr_pages = 0usize;
+            while round_start < pages.len() && ocr_pages < self.config.max_ocr_pages {
+                let (mut rendered, next_start) = {
                     let lib = Library::init();
                     let document = extract::load_document_from_input(&lib, ocr_input, password)?;
                     ocr_merge::render_pages_for_ocr(
@@ -820,14 +828,16 @@ impl LiteParse {
                     // engine's async recognition below.
                 };
                 round_start = next_start;
+                rendered.truncate(self.config.max_ocr_pages - ocr_pages);
                 if rendered.is_empty() {
                     // The scan reached the end without finding another page
                     // that needs OCR.
                     continue;
                 }
+                ocr_pages += rendered.len();
                 // `RenderedPage::idx` is absolute, so the whole slice is
                 // passed regardless of where this round started.
-                ocr_merge::ocr_and_merge_rendered(
+                ocr_pages_processed += ocr_merge::ocr_and_merge_rendered(
                     &mut pages,
                     rendered,
                     engine.clone(),
@@ -908,6 +918,7 @@ impl LiteParse {
             total_pages,
             pages: parsed_pages,
             page_errors,
+            ocr_pages_processed,
             text: full_text,
             outline,
             images,
@@ -949,6 +960,7 @@ impl LiteParse {
             total_pages,
             pages: parsed_pages,
             page_errors: Vec::new(),
+            ocr_pages_processed: 0,
             text: full_text,
             outline,
             images: Vec::new(),

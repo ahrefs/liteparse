@@ -16,6 +16,8 @@ pub enum PdfInput {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DocumentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keywords: Option<String>,
