@@ -76,18 +76,36 @@ fn catalog_facts(input: &PdfInput) -> Option<(Option<String>, Option<(String, bo
         .ok()
         .and_then(|object| document.dereference(object).ok())
         .and_then(|(_, object)| object.as_stream().ok())
-        .map(|stream| {
-            stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone())
-        })
-        .and_then(|bytes| {
-            let truncated = bytes.len() > XMP_MAX_BYTES;
-            let text =
-                String::from_utf8_lossy(&bytes[..bytes.len().min(XMP_MAX_BYTES)]).into_owned();
+        .and_then(xmp_stream_content)
+        .and_then(|(bytes, truncated)| {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
             (!text.trim().is_empty()).then_some((text, truncated))
         });
     Some((language, xmp))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn xmp_stream_content(stream: &lopdf::Stream) -> Option<(Vec<u8>, bool)> {
+    let mut bytes = Vec::with_capacity(XMP_MAX_BYTES + 1);
+    if stream.dict.get(b"Filter").is_err() {
+        bytes.extend_from_slice(&stream.content[..stream.content.len().min(XMP_MAX_BYTES + 1)]);
+    } else {
+        let filters = stream.filters().ok()?;
+        let has_decode_params = stream
+            .dict
+            .get(b"DecodeParms")
+            .is_ok_and(|params| !matches!(params, lopdf::Object::Null));
+        if filters.len() != 1 || filters[0] != b"FlateDecode" || has_decode_params {
+            return None;
+        }
+        flate2::read::ZlibDecoder::new(stream.content.as_slice())
+            .take((XMP_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+    }
+    let truncated = bytes.len() > XMP_MAX_BYTES;
+    bytes.truncate(XMP_MAX_BYTES);
+    Some((bytes, truncated))
 }
 
 fn extract_raw_facts<R: Read + Seek>(reader: &mut R) -> DocumentMetadata {
@@ -217,6 +235,7 @@ fn trailer_id_pair_differs(bytes: &[u8]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn extracts_raw_provenance_facts() {
@@ -272,5 +291,18 @@ mod tests {
         let metadata = extract_raw_facts(&mut std::io::Cursor::new(pdf));
         assert_eq!(metadata.startxref_count, Some(1));
         assert_eq!(metadata.eof_section_count, Some(1));
+    }
+
+    #[test]
+    fn xmp_decompression_stops_at_the_storage_limit() {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![b'x'; XMP_MAX_BYTES * 32]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let stream =
+            lopdf::Stream::new(lopdf::dictionary! { "Filter" => "FlateDecode" }, compressed);
+
+        let (bytes, truncated) = xmp_stream_content(&stream).unwrap();
+        assert_eq!(bytes.len(), XMP_MAX_BYTES);
+        assert!(truncated);
     }
 }
