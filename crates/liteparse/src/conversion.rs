@@ -946,6 +946,15 @@ pub async fn convert_image_to_pdf(
 }
 
 pub fn guess_extension_from_data(data: &[u8]) -> Option<String> {
+    // PDF readers allow the header within the first 1024 bytes.
+    if data
+        .windows(b"%PDF-".len())
+        .take(1024)
+        .any(|window| window == b"%PDF-")
+    {
+        return Some("pdf".to_string());
+    }
+
     // `file-format` inspects ZIP-based containers via their central directory
     // (requires the `reader` feature), so DOCX/XLSX/PPTX/ODF resolve to their
     // specific format instead of a generic "zip" regardless of entry ordering
@@ -1314,6 +1323,14 @@ mod tests {
         assert_eq!(
             guess_extension_from_data(&png_header).as_deref(),
             Some("png")
+        );
+    }
+
+    #[test]
+    fn test_guess_extension_from_data_pdf_with_preamble() {
+        assert!(
+            guess_extension_from_data(b"ignored preamble\r\n%PDF-1.5\n")
+                .is_some_and(|extension| extension == "pdf")
         );
     }
 
