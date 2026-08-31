@@ -4,6 +4,8 @@
 //! and WebAssembly re-export the same types with language-idiomatic wrappers.
 //!
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ── Public API re-exports ──────────────────────────────────────────────
 pub use config::{DEFAULT_PAGE_BATCH_SIZE, LiteParseConfig, OutputFormat};
 pub use error::LiteParseError;
