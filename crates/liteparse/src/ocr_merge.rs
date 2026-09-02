@@ -22,9 +22,10 @@ const MIN_IMAGE_SIZE_PT: f32 = 25.0;
 
 const MAX_IMAGE_OCR_TEXT_LENGTH: usize = 200;
 const MIN_IMAGE_OCR_COVERAGE: f32 = 0.2;
+const MAX_IMAGE_OCR_TEXT_COVERAGE: f32 = 0.15;
 
 /// A single image at or above this fraction of the page is treated as a
-/// full-page background and ignored.
+/// full-page scan/background rather than an inline figure.
 const MAX_IMAGE_PAGE_COVERAGE: f32 = 0.9;
 
 /// An XY-cut subtree must hold at least this many text items to count as a
@@ -51,10 +52,10 @@ pub(crate) struct RenderedPage {
     pub dpi: f32,
 }
 
-/// Why a page was flagged as needing more than the cheap text-only path.
-/// Multiple reasons can apply to one page (e.g. a sparse page whose little
-/// text is also garbled). `Garbled` is diagnostic and does not by itself
-/// require OCR.
+/// Why a page was classified as complex or text-poor. Multiple reasons can
+/// apply to one page (e.g. a sparse page whose little text is also garbled).
+/// `Garbled` does not by itself require OCR; with visual page selection,
+/// neither does `NoText`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComplexityReason {
@@ -62,9 +63,9 @@ pub enum ComplexityReason {
     /// no extractable text behind it — a scanned/photographed page.
     Scanned,
     /// Almost no extractable native text, and no full-page raster behind it
-    /// (a blank page, or a near-empty cover/divider). Check for a companion
-    /// `AnnotationText` before treating the page as blank — it means the text
-    /// is there, just outside the extractable surface.
+    /// (a blank page, page number, or near-empty cover/divider). Check for a
+    /// companion `AnnotationText` or `VectorText` before treating the page as
+    /// blank — those mean text is present outside the extractable surface.
     NoText,
     /// Some real text, but it covers very little of the page — typically a
     /// figure-heavy page with only thin captions.
@@ -132,7 +133,7 @@ pub struct PageComplexityStats {
     pub page_area: f32,
     /// Whether the page needs more than the cheap text-only path.
     pub needs_ocr: bool,
-    /// Every reason the page was flagged, in no particular priority order.
+    /// Classification reasons, in no particular priority order.
     pub reasons: Vec<ComplexityReason>,
     /// Layout-difficulty signals (columns, tables, dense graphics), computed
     /// from the post-projection page. Orthogonal to `needs_ocr`/`reasons`:
@@ -143,9 +144,27 @@ pub struct PageComplexityStats {
     pub layout: Option<LayoutComplexityStats>,
 }
 
+fn visual_image_ocr_reason(
+    text_length: usize,
+    text_coverage: f32,
+    full_page_image: bool,
+    image_coverage: f32,
+) -> Option<ComplexityReason> {
+    if text_length >= MAX_IMAGE_OCR_TEXT_LENGTH || text_coverage >= MAX_IMAGE_OCR_TEXT_COVERAGE {
+        None
+    } else if full_page_image {
+        Some(ComplexityReason::Scanned)
+    } else if image_coverage >= MIN_IMAGE_OCR_COVERAGE {
+        Some(ComplexityReason::SparseText)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn calculate_page_complexity(
     page: &Page,
     page_obj: &pdfium::Page,
+    visual_ocr_page_selection: bool,
 ) -> Result<PageComplexityStats, LiteParseError> {
     // Count only usable native text. Substitution-cipher-style corrupt
     // encodings (e.g. PDFs with a broken cmap) produce long "text" that looks
@@ -204,12 +223,19 @@ pub(crate) fn calculate_page_complexity(
     };
 
     let sparse_text = text_length < MAX_IMAGE_OCR_TEXT_LENGTH
-        && text_coverage < 0.15
+        && text_coverage < MAX_IMAGE_OCR_TEXT_COVERAGE
         && image_coverage >= MIN_IMAGE_OCR_COVERAGE;
+    let visual_image_reason = visual_ocr_page_selection
+        .then(|| {
+            visual_image_ocr_reason(text_length, text_coverage, full_page_image, image_coverage)
+        })
+        .flatten();
     let is_garbled = page_is_garbled(page);
 
     let mut reasons = Vec::new();
-    if text_length < 20 {
+    if visual_image_reason == Some(ComplexityReason::Scanned) {
+        reasons.push(ComplexityReason::Scanned);
+    } else if text_length < 20 {
         // Too little text to be the page's content. A full-page raster behind
         // it means a scan; otherwise it's effectively blank.
         reasons.push(if full_page_image {
@@ -217,13 +243,6 @@ pub(crate) fn calculate_page_complexity(
         } else {
             ComplexityReason::NoText
         });
-        // ...unless the text is there and simply out of PDFium's reach: text
-        // painted by an annotation appearance stream renders (so OCR gets it)
-        // but is never tokenized by the text API. Only checked on pages that
-        // already look empty, so the annotation walk stays off the hot path.
-        if page_obj.has_annotation_text() {
-            reasons.push(ComplexityReason::AnnotationText);
-        }
     } else if sparse_text {
         // There is real text, but it's too thin to be the whole page.
         reasons.push(ComplexityReason::SparseText);
@@ -231,7 +250,19 @@ pub(crate) fn calculate_page_complexity(
     if sparse_text {
         reasons.push(ComplexityReason::EmbeddedImages);
     }
-    let mut needs_ocr = !reasons.is_empty();
+    // ...unless the text is there and simply out of PDFium's reach: text
+    // painted by an annotation appearance stream renders (so OCR gets it)
+    // but is never tokenized by the text API. Only checked on pages that
+    // already look empty, so the annotation walk stays off the hot path.
+    let annotation_text = text_length < 20 && page_obj.has_annotation_text();
+    if annotation_text {
+        reasons.push(ComplexityReason::AnnotationText);
+    }
+    let mut needs_ocr = if visual_ocr_page_selection {
+        visual_image_reason.is_some() || annotation_text
+    } else {
+        !reasons.is_empty()
+    };
     if is_garbled {
         reasons.push(ComplexityReason::Garbled);
     }
@@ -443,6 +474,7 @@ pub(crate) const MAX_OCR_RENDER_LONG_EDGE_PX: f32 = 4096.0;
 pub(crate) fn render_pages_for_ocr(
     document: &Document,
     pages: &[Page],
+    visual_ocr_page_selection: bool,
     start: usize,
     max_rasters: usize,
     dpi: f32,
@@ -481,7 +513,8 @@ pub(crate) fn render_pages_for_ocr(
             } else {
                 document.page(page_index)?
             };
-            let page_complexity = calculate_page_complexity(page, &page_obj)?;
+            let page_complexity =
+                calculate_page_complexity(page, &page_obj, visual_ocr_page_selection)?;
 
             if !page_complexity.needs_ocr {
                 return Ok(None);
@@ -648,13 +681,10 @@ pub(crate) async fn ocr_and_merge_rendered(
     // from incidental per-page failures. Without this, every page logs the same
     // error and `parse()` still returns "success" with no OCR text.
     //
-    // We additionally track whether any *sparse-text* page failed: a page is
-    // rendered for OCR if it has sparse native text OR merely contains an image
-    // (`needs_ocr = text_length < 20 || text_coverage < 0.15 || has_images`).
-    // A native-text PDF with a logo on every page is rendered for OCR
-    // enrichment but already has all its text. We must only fail loud when OCR
-    // failure destroyed a sparse page's likely primary text source — otherwise
-    // a broken OCR setup would abort perfectly good native-text documents.
+    // We additionally track whether any text-poor page failed. We must only
+    // fail loud when OCR failure destroyed a page's likely primary text source;
+    // a broken OCR setup must not abort a native-text document whose selected
+    // pages merely needed image-based enrichment.
     let total_tasks = task_results.len();
     let mut failed_tasks = 0usize;
     let mut failed_sparse_text_page = false;
@@ -822,11 +852,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     Ok(total_tasks - failed_tasks)
 }
 
-/// True when the page's native (already-extracted) text is sparse enough that
-/// OCR is likely its primary text source. Mirrors the non-image predicates in
-/// `render_pages_for_ocr` (`text_length < 20 || text_coverage < 0.15`) so the
-/// systemic-failure guard matches the same pages that were rendered because
-/// their native text was insufficient.
+/// True when the native text is too sparse to survive a total OCR failure.
 fn page_has_sparse_native_text(page: &Page) -> bool {
     let text_length: usize = page
         .text_items
@@ -847,7 +873,7 @@ fn page_has_sparse_native_text(page: &Page) -> bool {
         0.0
     };
 
-    text_length < 20 || text_coverage < 0.15
+    text_length < 20 || text_coverage < MAX_IMAGE_OCR_TEXT_COVERAGE
 }
 
 /// A native text item that cannot be trusted as a text source: either its
@@ -1097,6 +1123,19 @@ fn clean_ocr_table_artifacts(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::types::Rect;
+
+    #[test]
+    fn test_visual_image_ocr_reason() {
+        assert_eq!(
+            visual_image_ocr_reason(21, 0.001, true, 0.0),
+            Some(ComplexityReason::Scanned)
+        );
+        assert_eq!(visual_image_ocr_reason(0, 0.0, false, 0.0), None);
+        assert_eq!(
+            visual_image_ocr_reason(0, 0.0, false, MIN_IMAGE_OCR_COVERAGE),
+            Some(ComplexityReason::SparseText)
+        );
+    }
 
     fn leaf(n: usize) -> Region {
         Region {

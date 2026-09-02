@@ -403,11 +403,14 @@ impl LiteParse {
             // the layout zip below stays aligned.
             let mut kept_pages = Vec::with_capacity(pages.len());
             let mut page_complexities = Vec::with_capacity(pages.len());
+            let visual = self.config.visual_ocr_page_selection;
             for page in pages {
                 let stats = document
                     .page((page.page_number - 1) as i32)
                     .map_err(LiteParseError::from)
-                    .and_then(|page_obj| ocr_merge::calculate_page_complexity(&page, &page_obj));
+                    .and_then(|page_obj| {
+                        ocr_merge::calculate_page_complexity(&page, &page_obj, visual)
+                    });
                 match stats {
                     Ok(stats) => {
                         page_complexities.push(stats);
@@ -714,11 +717,14 @@ impl LiteParse {
             ));
             let complexity = if self.config.include_complexity {
                 let mut complexity = Vec::with_capacity(pages.len());
+                let visual = self.config.visual_ocr_page_selection;
                 for page in &pages {
                     let stats = analysis_document
                         .page((page.page_number - 1) as i32)
                         .map_err(LiteParseError::from)
-                        .and_then(|page_obj| ocr_merge::calculate_page_complexity(page, &page_obj));
+                        .and_then(|page_obj| {
+                            ocr_merge::calculate_page_complexity(page, &page_obj, visual)
+                        });
                     match stats {
                         Ok(stats) => complexity.push(stats),
                         // The page's text is already extracted; a tolerant
@@ -816,6 +822,7 @@ impl LiteParse {
                     ocr_merge::render_pages_for_ocr(
                         &document,
                         &pages,
+                        self.config.visual_ocr_page_selection,
                         round_start,
                         round_rasters,
                         self.config.dpi,

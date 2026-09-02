@@ -642,13 +642,14 @@ async fn test_filled_acroform_values_are_extracted_as_text() {
     );
 }
 
-/// A blank multi-page PDF: no text, so every page is text-poor and routes to
-/// OCR. Pages take distinct sizes so each page's raster is uniquely
-/// identifiable by the dimensions the OCR engine receives.
-fn blank_pdf(page_sizes: &[(u32, u32)]) -> Vec<u8> {
+/// A multi-page PDF with selected pages backed by full-page images.
+fn ocr_fixture_pdf(page_sizes: &[(u32, u32)], scanned_pages: &[bool]) -> Vec<u8> {
+    assert_eq!(page_sizes.len(), scanned_pages.len());
     let kids: Vec<String> = (0..page_sizes.len())
         .map(|i| format!("{} 0 R", i + 3))
         .collect();
+    let content_start = page_sizes.len() + 3;
+    let image_id = page_sizes.len() * 2 + 3;
     let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         format!(
@@ -658,12 +659,36 @@ fn blank_pdf(page_sizes: &[(u32, u32)]) -> Vec<u8> {
         )
         .into_bytes(),
     ];
-    for (width, height) in page_sizes {
+    for (index, (width, height)) in page_sizes.iter().enumerate() {
         objects.push(
-            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] >>")
-                .into_bytes(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] \
+                 /Resources << /XObject << /Im0 {image_id} 0 R >> >> \
+                 /Contents {} 0 R >>",
+                content_start + index
+            )
+            .into_bytes(),
         );
     }
+    for ((width, height), scanned) in page_sizes.iter().zip(scanned_pages) {
+        let stream = if *scanned {
+            format!("q {width} 0 0 {height} 0 0 cm /Im0 Do Q")
+        } else {
+            String::new()
+        };
+        objects.push(
+            format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            )
+            .into_bytes(),
+        );
+    }
+    objects.push(
+        b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+          /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\0\nendstream"
+            .to_vec(),
+    );
     let mut pdf = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
     for (index, object) in objects.iter().enumerate() {
@@ -807,7 +832,7 @@ async fn test_ocr_rounds_cover_every_page_once() {
     // One page per round: four rounds, recognition fully serialized.
     let (parser, calls, peak) = run(1);
     let serialized = parser
-        .parse_input(PdfInput::Bytes(blank_pdf(&page_sizes)))
+        .parse_input(PdfInput::Bytes(ocr_fixture_pdf(&page_sizes, &[false; 4])))
         .await
         .expect("single-page-round OCR parse should succeed");
     assert_pages_carry_own_rasters(&serialized, "rounds of 1");
@@ -826,7 +851,7 @@ async fn test_ocr_rounds_cover_every_page_once() {
     // recognition, identical routing.
     let (parser, calls, peak) = run(4);
     let overlapped = parser
-        .parse_input(PdfInput::Bytes(blank_pdf(&page_sizes)))
+        .parse_input(PdfInput::Bytes(ocr_fixture_pdf(&page_sizes, &[false; 4])))
         .await
         .expect("single-round OCR parse should succeed");
     assert_pages_carry_own_rasters(&overlapped, "rounds of 4");
@@ -838,14 +863,14 @@ async fn test_ocr_rounds_cover_every_page_once() {
 }
 
 /// A round is bounded by rasters rendered, not by page span, so OCR-needing
-/// pages that are sparsely scattered through a mostly-native-text document
+/// pages that are sparsely scattered through pages that skip OCR
 /// still fill a round and recognize concurrently.
 ///
 /// This guards a real regression: bounding the round by page span instead
 /// made each round contain only the OCR-needing pages that happened to fall
 /// inside its span — often one or two — which starved the worker pool and
-/// serialized recognition. On this document that was a 2.4x wall-clock loss
-/// at realistic OCR latency, with no test failing.
+/// serialized recognition, causing a measured 2.4x wall-clock loss at
+/// realistic OCR latency with no test failing.
 #[tokio::test]
 #[serial]
 async fn test_ocr_rounds_fill_across_sparse_pages() {
@@ -856,6 +881,7 @@ async fn test_ocr_rounds_fill_across_sparse_pages() {
     let peak = Arc::new(AtomicUsize::new(0));
     let parser = LiteParse::new(LiteParseConfig {
         ocr_enabled: true,
+        visual_ocr_page_selection: true,
         num_workers: 8,
         dpi: 72.0, // Small rasters: this test is about scheduling, not pixels.
         quiet: true,
@@ -867,10 +893,15 @@ async fn test_ocr_rounds_fill_across_sparse_pages() {
         peak_in_flight: peak.clone(),
     }));
 
+    let page_sizes = [(612, 792); 17];
+    let scanned_pages: Vec<bool> = (0..page_sizes.len()).map(|index| index % 2 == 0).collect();
     let result = parser
-        .parse("../../demo/docs/apple-10k-2024.pdf")
+        .parse_input(PdfInput::Bytes(ocr_fixture_pdf(
+            &page_sizes,
+            &scanned_pages,
+        )))
         .await
-        .expect("should parse the 10-K with OCR enabled");
+        .expect("should parse the mixed OCR fixture");
 
     let recognized = calls.load(Ordering::SeqCst);
     assert!(
@@ -879,7 +910,7 @@ async fn test_ocr_rounds_fill_across_sparse_pages() {
     );
     assert!(
         result.pages.len() > recognized,
-        "fixture should be mostly native text, so OCR pages ({recognized}) must be sparse \
+        "OCR pages ({recognized}) must be interleaved with skipped pages \
          among its {} pages",
         result.pages.len()
     );

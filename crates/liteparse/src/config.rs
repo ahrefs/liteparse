@@ -7,6 +7,11 @@ pub struct LiteParseConfig {
     pub ocr_language: String,
     /// Whether OCR is enabled. When true, runs on text-sparse pages and embedded images.
     pub ocr_enabled: bool,
+    /// Use visual-content evidence to skip blank pages and recognize scans
+    /// with small native-text overlays. Default `false` preserves legacy
+    /// page selection.
+    #[serde(default)]
+    pub visual_ocr_page_selection: bool,
     /// Maximum number of pages on which OCR may run during one parse.
     #[serde(default = "default_max_ocr_pages")]
     pub max_ocr_pages: usize,
@@ -231,6 +236,7 @@ impl Default for LiteParseConfig {
             // fast if no engine is reachable, so a real misconfiguration is
             // never silently swallowed.
             ocr_enabled: cfg!(feature = "tesseract"),
+            visual_ocr_page_selection: false,
             max_ocr_pages: usize::MAX,
             ocr_server_url: None,
             ocr_server_headers: Vec::new(),
